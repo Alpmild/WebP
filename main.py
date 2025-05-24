@@ -2,10 +2,63 @@ from PIL import Image
 import struct
 from collections import Counter
 
-from Constants import *
-from sec_functions import *
+from secondary import *
+
+
+def decode(data: bytes, root: Huffman.Node, padding: int, mode: str):
+    assert mode == 'AC' or mode == 'DC'
+
+    bits_buffer = ''.join(f'{byte:08b}' for byte in data)
+    if padding > 0:
+        bits_buffer = bits_buffer[:-padding]
+
+    decoded = []
+    cur_node = root
+    i = 0
+
+    while i < len(bits_buffer):
+        bit = bits_buffer[i]
+        i += 1
+        cur_node = cur_node.left if bit == '0' else cur_node.right
+
+        if cur_node.value is not None:
+            if mode == 'DC':
+                cat = cur_node.value
+                if cat != 0:
+                    dc = iconvert_num(bits_buffer[i:i + cat], cat)
+                    decoded.append(dc)
+                else:
+                    decoded.append(0)
+                i += cat
+            else:
+                run_len, cat = cur_node.value
+                decoded.extend([0] * run_len)
+                if cat != 0:
+                    ac = iconvert_num(bits_buffer[i:i + cat], cat)
+                    decoded.append(ac)
+                else:
+                    break
+                i += cat
+            cur_node = root
+
+    # for i in range(1, len(decoded)):
+    #     decoded[i] += decoded[i - 1]
+
+    return np.array(decoded)
+
 
 class WebPEncoder:
+    def __init__(self, path, scale):
+        image = Image.open(path)
+        self.mode = modes.index(image.mode)
+        if image.mode in ('L', '1'):
+            image = image.convert('RGB')
+        self.image = np.array(image)
+
+        self.scale = scale
+        self.y_quant = quant_matrix(Y_QUANT, scale)
+        self.uv_quant = quant_matrix(UV_QUANT, scale)
+
     @staticmethod
     def toYUV(rgb_image: np.array):
         R = rgb_image[:, :, 0].astype(np.float32)
@@ -16,7 +69,7 @@ class WebPEncoder:
         U = -0.14713 * R - 0.28886 * G + 0.436 * B + 128
         V = 0.615 * R - 0.51499 * G - 0.10001 * B + 128
 
-        yuv_image = np.stack([Y, U, V], axis=-1).clip(0, 255).astype(np.uint8)
+        yuv_image = np.stack([Y, U, V], axis=-1).clip(0, 255).astype(int)
         return yuv_image
 
     @staticmethod
@@ -27,14 +80,14 @@ class WebPEncoder:
         for i in range(0, h, 2):
             for j in range(0, w, 2):
                 block = channel[i:i + 2, j:j + 2]
-                downsampled[i // 2, j // 2] = np.mean(block)
+                downsampled[i // 2, j // 2] = block[0, 0]
 
-        return downsampled.astype(np.uint8)
+        return downsampled.astype(np.int32)
 
     @staticmethod
     def extend_matrix(matrix: np.array, n):
         h, w = matrix.shape
-        new_h, new_w = int(np.ceil(h / n) * n), int(np.ceil(w / n) * n)
+        new_h, new_w = (h + n - 1) // n * n, (w + n - 1) // n * n
         if new_h == h and new_w == w:
             return matrix
 
@@ -49,22 +102,14 @@ class WebPEncoder:
     @staticmethod
     def split_blocks(image_arr: np.array, n):
         h, w, *_ = image_arr.shape
-        if h % n != 0 or w % n != 0:
-            new_h = n * (h // n + bool(h % n))
-            new_w = n * (w // n + bool(w % n))
+        blocks_array = np.array([image_arr[i:i + n, j:j + n] for i in range(0, h, n) for j in range(0, w, n)])
 
-            new_image = np.full((new_h, new_w), 0, dtype=object)
-            new_image[:h, :w] = image_arr
-
-            image_arr = new_image
-            h, w = new_h, new_w
-
-        blocks_array = np.array([image_arr[i:i + n, j: j + n] for i in range(0, h, n) for j in range(0, w, n)])
         return blocks_array
 
     @staticmethod
-    def dct(block: np.ndarray, n):
+    def dct(block: np.ndarray):
         def F(u, v):
+            n = block.shape[0]
             x = np.arange(n)
             y = np.arange(n)
 
@@ -77,22 +122,26 @@ class WebPEncoder:
             res *= c_dct(u) * c_dct(v) * 2 / n
             return res
 
-        return np.array([[F(i, j) for j in range(n)] for i in range(n)])
+        h, w = block.shape[:2]
+        if h != w:
+            raise ValueError(f"Матрица должна быть квадратной: h={h}, w={w}")
+        n_ = h
+        return np.array([[F(i, j) for j in range(n_)] for i in range(n_)])
+        # return DCT_MAT @ block @ DCT_MAT.T
 
     @staticmethod
     def quantize_block(block, qmatrix):
         return np.round(block / qmatrix).astype(np.int32)
 
     @staticmethod
-    def zigzag(matrix):
-        n = len(matrix)
+    def zigzag(matrix, n=N):
         result = []
         i, j = 0, 0
 
         for _ in range(n * n):
             result.append(matrix[i][j])
 
-            if (i + j) % 2 == 0:  # Движение вверх-вправо
+            if (i + j) % 2 == 0:
                 if j == n - 1:
                     i += 1
                 elif i == 0:
@@ -100,7 +149,7 @@ class WebPEncoder:
                 else:
                     i -= 1
                     j += 1
-            else:  # Движение вниз-влево
+            else:
                 if i == n - 1:
                     j += 1
                 elif j == 0:
@@ -114,20 +163,20 @@ class WebPEncoder:
     @staticmethod
     def encode_dc(arr: np.array, file):
         n = len(arr)
-        arr = tuple(map(int, arr))
+        arr_dc = tuple(map(int, arr))
 
-        arr_dc = (arr[0],) + tuple(map(lambda i: arr[i] - arr[i - 1], range(1, n)))
+        # arr_dc = (arr[0],) + tuple(map(lambda i: arr[i] - arr[i - 1], range(1, n)))
         categories = tuple(map(category, arr_dc))
         freq_dict = dict(Counter(categories))
 
         # Запись количества категорий
         file.write(struct.pack('>H', len(freq_dict)))
         # Запись словаря частотностей
-        for i in sorted(freq_dict.keys()):
+        for i in freq_dict.keys():
             file.write(struct.pack(CAT_FORM, i, freq_dict[i]))
 
-        root = Huf.build_tree(freq_dict)
-        codes = Huf.build_code(root)
+        root = Huffman.build_tree(freq_dict)
+        codes = Huffman.build_code(root)
 
         huf_str = ""
         encoded = bytearray()
@@ -135,7 +184,7 @@ class WebPEncoder:
             dc = arr_dc[i]
             cat = category(dc)
 
-            huf_str += codes[cat] + convert(dc, cat)
+            huf_str += codes[cat] + convert_num(dc, cat)
             while len(huf_str) >= 8:
                 encoded.append(int(huf_str[:8], 2))
                 huf_str = huf_str[8:]
@@ -155,8 +204,8 @@ class WebPEncoder:
     @staticmethod
     def encode_ac(arr: np.array, file):
         n = len(arr)
-        arr = tuple(map(int, arr))
-        arr_ac = (arr[0],) + tuple(map(lambda i: arr[i] - arr[i - 1], range(1, n)))
+        arr_ac = tuple(map(int, arr))
+        # arr_ac = (arr[0],) + tuple(map(lambda i: arr[i] - arr[i - 1], range(1, n)))
         ac, rle_ac = [], []
 
         zeros_cnt = 0
@@ -175,17 +224,17 @@ class WebPEncoder:
         # Запись количества пар
         file.write(struct.pack('>H', len(freq_dict)))
         # Запись словаря частотностей
-        for couple, value in sorted(freq_dict.items()):
-            file.write(struct.pack(RLE_CAT_FORM, *couple, value))
+        for couple in freq_dict.keys():
+            file.write(struct.pack(RLE_CAT_FORM, *couple, freq_dict[couple]))
 
-        root = Huf.build_tree(freq_dict)
-        codes = Huf.build_code(root)
+        root = Huffman.build_tree(freq_dict)
+        codes = Huffman.build_code(root)
 
         huf_str = ""
         encoded = bytearray()
         for i in range(len(rle_ac)):
             cat = rle_ac[i][1]
-            huf_str += codes[rle_ac[i]] + convert(ac[i], cat)
+            huf_str += codes[rle_ac[i]] + convert_num(ac[i], cat)
 
             while len(huf_str) >= 8:
                 encoded.append(int(huf_str[:8], 2))
@@ -203,8 +252,42 @@ class WebPEncoder:
         # Число нулей, добавленных в конец
         file.write(struct.pack('>B', padding))
 
+    def process(self, path, prediction, block_size=N):
+        h, w = self.image.shape[:2]
+        output_file = open(path, "wb")
+        output_file.write(struct.pack(INFO_FORM, h, w, self.mode, block_size, self.scale, PREDS_KEYS.index(prediction)))
+
+        image_yuv = self.toYUV(self.image)
+        for i in range(3):
+            channel = image_yuv[:, :, i]
+            if i != 0:
+                channel = self.downsampling(channel)
+            channel = self.extend_matrix(channel, block_size)
+            channel = convert(channel, prediction, 0, block_size)
+
+            blocks = self.split_blocks(channel, block_size)
+            blocks = np.array(tuple(map(self.dct, blocks)))
+
+            qmatrix = self.y_quant if i == 0 else self.uv_quant
+            blocks = np.array(tuple(map(lambda x: self.quantize_block(x, qmatrix), blocks)))
+            blocks = np.array(tuple(map(lambda x: self.zigzag(x), blocks)))
+
+            dc = blocks[:, 0]
+            print("DC", len(dc))
+            self.encode_dc(dc, output_file)
+
+            ac = np.hstack(blocks[:, 1:])
+            print("AC", len(ac))
+            self.encode_ac(ac, output_file)
+
+        output_file.close()
+        print()
+
 
 class WebPDecoder:
+    def __init__(self, path):
+        self.image = open(path, "rb")
+
     @staticmethod
     def from_YUV(yuv_image: np.array):
         Y = yuv_image[:, :, 0].astype(np.float32)
@@ -227,10 +310,10 @@ class WebPDecoder:
             for j in range(w):
                 restored[2 * i: 2 * i + 2, 2 * j: 2 * j + 2] = channel[i, j]
 
-        return restored.astype(np.uint8)
+        return restored.astype(np.int32)
 
     @staticmethod
-    def join_blocks(blocks: np.array, h, w, n=macro_N):
+    def join_blocks(blocks: np.array, h, w, n=N):
         new_h, new_w = h, w
         if h % n != 0 or w % n != 0:
             new_h = n * int(np.ceil(h / n))
@@ -245,8 +328,9 @@ class WebPDecoder:
         return image[:h, :w]
 
     @staticmethod
-    def idct(block: np.ndarray, n):
+    def idct(block: np.ndarray):
         def F(x, y):
+            n = block.shape[0]
             u = np.arange(n)
             v = np.arange(n)
 
@@ -263,21 +347,26 @@ class WebPDecoder:
             res *= 2 / n
             return res
 
-        return np.array([[F(i, j) for j in range(n)] for i in range(n)])
+        h, w = block.shape[:2]
+        if h != w:
+            raise ValueError(f"Матрица должна быть квадратной: h={h}, w={w}")
+        n_ = h
+        return np.array([[F(i, j) for j in range(n_)] for i in range(n_)])
+        # return DCT_MAT_INV @ block @ DCT_MAT_INV.T
 
     @staticmethod
     def restore_block(block, qmatrix):
         return np.round(block * qmatrix).astype(np.int32)
 
     @staticmethod
-    def inverse_zigzag(arr, n=8):
+    def inverse_zigzag(arr, n=N):
         matrix = [[0] * n for _ in range(n)]
         i, j = 0, 0
 
         for idx in range(n * n):
             matrix[i][j] = arr[idx]
 
-            if (i + j) % 2 == 0:  # Движение вверх-вправо
+            if (i + j) % 2 == 0:
                 if j == n - 1:
                     i += 1
                 elif i == 0:
@@ -285,7 +374,7 @@ class WebPDecoder:
                 else:
                     i -= 1
                     j += 1
-            else:  # Движение вниз-влево
+            else:
                 if i == n - 1:
                     j += 1
                 elif j == 0:
@@ -295,3 +384,87 @@ class WebPDecoder:
                     j -= 1
 
         return np.array(matrix)
+
+    @staticmethod
+    def decode(file, mode):
+        assert mode == 'AC' or mode == 'DC'
+
+        freg_dict_len = struct.unpack('>H', file.read(2))[0]
+        freq_dict = dict()
+        for i in range(freg_dict_len):
+            form = CAT_FORM if mode == 'DC' else RLE_CAT_FORM
+            s = struct.calcsize(form)
+            couple = struct.unpack(form, file.read(s))
+
+            key, value = couple if mode == 'DC' else (couple[:2], couple[2])
+            freq_dict[key] = value
+
+        len_data = struct.unpack(SEQ_LEN_FORM, file.read(struct.calcsize(SEQ_LEN_FORM)))[0]
+        data = file.read(len_data)
+        padding = struct.unpack('>B', file.read(1))[0]
+
+        root = Huffman.build_tree(freq_dict)
+        return decode(data, root=root, padding=padding, mode=mode)
+
+    def process(self, path):
+        size = struct.calcsize(INFO_FORM)
+        h, w, mode, block_size, scale, pred_ind = struct.unpack(INFO_FORM, self.image.read(size))
+        mode = modes[mode]
+
+        k = block_size ** 2 - 1
+        y_cnt = int(np.ceil(h / block_size) * np.ceil(h / block_size))
+        uv_cnt = int(np.ceil(h // 2 / block_size) * np.ceil(h // 2 / block_size))
+
+        y_qmatrix = quant_matrix(Y_QUANT, scale)
+        uv_qmatrix = quant_matrix(UV_QUANT, scale)
+
+        channels = tuple()
+        for i in range(3):
+            if i == 0:
+                b = y_cnt
+                qmatrix = y_qmatrix
+            else:
+                b = uv_cnt
+                qmatrix = uv_qmatrix
+            dc = np.array(self.decode(self.image, 'DC'))
+            print("DC", len(dc))
+            dc.resize(b, 1)
+
+            ac = np.array(self.decode(self.image, 'AC'))
+            print("AC", len(ac))
+            ac.resize(b, k)
+
+            blocks = tuple(
+                map(lambda x: np.array(self.inverse_zigzag(np.concatenate((dc[x], ac[x])), block_size)), range(b)))
+            blocks = np.array(tuple(map(lambda x: self.restore_block(x, qmatrix), blocks)))
+
+            blocks = np.array(tuple(map(self.idct, blocks)))
+
+            size = 4 * block_size
+            h_, w_ = (h + size - 1) // size * size, (w + size - 1) // size * size
+            shape = (h_ // 2, w_ // 2) if i != 0 else (h_, w_)
+            channel = self.join_blocks(blocks, *shape, block_size)
+
+            channel = convert(channel, PREDS_KEYS[pred_ind], 1, block_size)
+            if i != 0:
+                channel = self.idownsampling(channel)
+            channel = channel[:h, :w]
+
+            channels += (channel,)
+
+        new_image = np.stack(channels, axis=-1).clip(0, 255).astype(np.int16)
+        new_image = Image.fromarray(self.from_YUV(new_image))
+
+        new_image.save(path)
+        print()
+
+
+mode = "H"
+file = "Cyberpunk"
+temp_file = "Images\\test"
+
+enc = WebPEncoder(f"Images\\Originals\\{file}.png", 70)
+enc.process(temp_file, prediction=mode)
+
+dec = WebPDecoder(temp_file)
+dec.process(f"Images\\{file}_restored_{mode}.png")
