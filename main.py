@@ -2,7 +2,7 @@ from PIL import Image
 import struct
 from collections import Counter
 
-from secondary import *
+from sec_functions import *
 
 
 def decode(data: bytes, root: Huffman.Node, padding: int, mode: str):
